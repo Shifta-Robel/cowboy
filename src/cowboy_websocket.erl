@@ -65,6 +65,8 @@
 -callback terminate(any(), cowboy_req:req(), any()) -> ok.
 -optional_callbacks([terminate/3]).
 
+-type tick_interval() :: 1..10.
+
 -type opts() :: #{
 	active_n => pos_integer(),
 	compress => boolean(),
@@ -75,7 +77,8 @@
 	idle_timeout => timeout(),
 	max_frame_size => non_neg_integer() | infinity,
 	req_filter => fun((cowboy_req:req()) -> map()),
-	validate_utf8 => boolean()
+	validate_utf8 => boolean(),
+	ping_timeout => tick_interval()
 }.
 -export_type([opts/0]).
 
@@ -112,7 +115,8 @@
 	deflate = true :: boolean(),
 	extensions = #{} :: map(),
 	req = #{} :: map(),
-	shutdown_reason = normal :: any()
+	shutdown_reason = normal :: any(),
+	ping_timeout = nil :: nil() | tick_interval()
 }).
 
 %% Because the HTTP/1.1 and HTTP/2 handshakes are so different,
@@ -320,7 +324,8 @@ takeover(Parent, Ref, Socket, Transport, Opts, Buffer,
 		key=undefined, messages=Messages,
 		%% Dynamic buffer only applies to HTTP/1.1 Websocket.
 		dynamic_buffer_size=init_dynamic_buffer_size(Opts),
-		dynamic_buffer_moving_average=maps:get(dynamic_buffer_initial_average, Opts, 0)}, 0),
+		dynamic_buffer_moving_average=maps:get(dynamic_buffer_initial_average, Opts, 0),
+	    ping_timeout =maps:get(ping_timeout, Opts, nil)}, 0),
 	%% We call parse_header/3 immediately because there might be
 	%% some data in the buffer that was sent along with the handshake.
 	%% While it is not allowed by the protocol to send frames immediately,
@@ -337,12 +342,16 @@ takeover(Parent, Ref, Socket, Transport, Opts, Buffer,
 maybe_socket_error(_, _) ->
 	ok.
 
-after_init(State=#state{active=true}, HandlerState, ParseState) ->
+after_init(State=#state{active=true, ping_timeout=PingTimeout}, HandlerState, ParseState) ->
 	%% Enable active,N for HTTP/1.1, and auto read_body for HTTP/2.
 	%% We must do this only after calling websocket_init/1 (if any)
 	%% to give the handler a chance to disable active mode immediately.
 	setopts_active(State),
 	maybe_read_body(State),
+	case PingTimeout of
+		nil -> ok;
+		_Pt -> transport_send(State, nofin, frame(ping, State))
+	end,
 	parse_header(State, HandlerState, ParseState);
 after_init(State, HandlerState, ParseState) ->
 	parse_header(State, HandlerState, ParseState).
@@ -424,8 +433,19 @@ set_idle_timeout(State=#state{opts=Opts, timeout_ref=PrevRef}, TimeoutNum) ->
 
 tick_idle_timeout(State=#state{timeout_num=?IDLE_TIMEOUT_TICKS}, HandlerState, _) ->
 	websocket_close(State, HandlerState, timeout);
-tick_idle_timeout(State=#state{timeout_num=TimeoutNum}, HandlerState, ParseState) ->
+tick_idle_timeout(State=#state{timeout_num=TimeoutNum, ping_timeout=PTimeout},
+				  HandlerState, ParseState) ->
+	maybe_send_ping(PTimeout, TimeoutNum, State),
 	before_loop(set_idle_timeout(State, TimeoutNum + 1), HandlerState, ParseState).
+
+maybe_send_ping(nil, _TimeoutNum, _State) -> ok;
+maybe_send_ping(PingTimeout, TimeoutNum, State) ->
+	if PingTimeout =:= TimeoutNum orelse
+	   PingTimeout =:= TimeoutNum + 2 orelse
+	   PingTimeout =:= TimeoutNum + 3 ->
+			transport_send(State, nofin, frame(ping, State));
+	   true -> ok
+	end.
 
 -spec loop(#state{}, any(), parse_state()) -> no_return().
 loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
