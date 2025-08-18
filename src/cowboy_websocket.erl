@@ -62,8 +62,11 @@
 -callback websocket_info(any(), State)
 	-> call_result(State) | deprecated_call_result(State) when State::any().
 
+-callback websocket_status(disconnected | connected, State) ->
+         call_result(State) | deprecated_call_result(State) when State::any().
+
 -callback terminate(any(), cowboy_req:req(), any()) -> ok.
--optional_callbacks([terminate/3]).
+-optional_callbacks([websocket_status/2, terminate/3]).
 
 -type tick_interval() :: 1..10.
 
@@ -78,7 +81,8 @@
 	max_frame_size => non_neg_integer() | infinity,
 	req_filter => fun((cowboy_req:req()) -> map()),
 	validate_utf8 => boolean(),
-	ping_timeout => tick_interval()
+	ping_timeout => tick_interval(),
+	notify_status_timeout => tick_interval()
 }.
 -export_type([opts/0]).
 
@@ -116,7 +120,9 @@
 	extensions = #{} :: map(),
 	req = #{} :: map(),
 	shutdown_reason = normal :: any(),
-	ping_timeout = nil :: nil() | tick_interval()
+	ping_timeout = nil :: nil() | tick_interval(),
+	ws_status_exported = false :: boolean(),
+	notify_status_timeout = 5 :: tick_interval()
 }).
 
 %% Because the HTTP/1.1 and HTTP/2 handshakes are so different,
@@ -325,7 +331,9 @@ takeover(Parent, Ref, Socket, Transport, Opts, Buffer,
 		%% Dynamic buffer only applies to HTTP/1.1 Websocket.
 		dynamic_buffer_size=init_dynamic_buffer_size(Opts),
 		dynamic_buffer_moving_average=maps:get(dynamic_buffer_initial_average, Opts, 0),
-	    ping_timeout =maps:get(ping_timeout, WsOpts, nil)}, 0),
+	    ping_timeout =maps:get(ping_timeout, WsOpts, nil),
+		ws_status_exported =erlang:function_exported(Handler, websocket_status, 1),
+		notify_status_timeout = maps:get(notify_status_timeout, WsOpts, 5)}, 0),
 	%% We call parse_header/3 immediately because there might be
 	%% some data in the buffer that was sent along with the handshake.
 	%% While it is not allowed by the protocol to send frames immediately,
@@ -429,13 +437,22 @@ set_idle_timeout(State=#state{opts=Opts, timeout_ref=PrevRef}, TimeoutNum) ->
 			State#state{timeout_ref=TRef, timeout_num=TimeoutNum}
 	end.
 
--define(reset_idle_timeout(State), State#state{timeout_num=0}).
+reset_idle_timeout(State =#state{ws_status_exported=WSExported}, HandlerStatus) ->
+    if WSExported ->
+	    (State#state.handler):websocket_status(connected, HandlerStatus);
+       true -> ok
+    end,
+    State#state{timeout_num=0}.
 
 tick_idle_timeout(State=#state{timeout_num=?IDLE_TIMEOUT_TICKS}, HandlerState, _) ->
 	websocket_close(State, HandlerState, timeout);
-tick_idle_timeout(State=#state{timeout_num=TimeoutNum, ping_timeout=PTimeout},
+tick_idle_timeout(State=#state{timeout_num=TimeoutNum, ping_timeout=PTimeout, ws_status_exported=WSExported},
 				  HandlerState, ParseState) ->
 	maybe_send_ping(PTimeout, TimeoutNum, State),
+	if WSExported andalso State#state.notify_status_timeout == TimeoutNum ->
+			(State#state.handler):websocket_status(disconnected, HandlerState);
+	   true -> ok
+	end,
 	before_loop(set_idle_timeout(State, TimeoutNum + 1), HandlerState, ParseState).
 
 maybe_send_ping(nil, _TimeoutNum, _State) -> ok;
@@ -454,7 +471,7 @@ loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
 		%% Socket messages. (HTTP/1.1)
 		{OK, Socket, Data} when OK =:= element(1, Messages) ->
 			State1 = maybe_resize_buffer(State, Data),
-			parse(?reset_idle_timeout(State1), HandlerState, ParseState, Data);
+			parse(reset_idle_timeout(State1, HandlerState), HandlerState, ParseState, Data);
 		{Closed, Socket} when Closed =:= element(2, Messages) ->
 			terminate(State, HandlerState, {error, closed});
 		{Error, Socket, Reason} when Error =:= element(3, Messages) ->
@@ -467,13 +484,13 @@ loop(State=#state{parent=Parent, socket=Socket, messages=Messages,
 		%% Body reading messages. (HTTP/2)
 		{request_body, _Ref, nofin, Data} ->
 			maybe_read_body(State),
-			parse(?reset_idle_timeout(State), HandlerState, ParseState, Data);
+			parse(reset_idle_timeout(State, HandlerState), HandlerState, ParseState, Data);
 		%% @todo We need to handle this case as if it was an {error, closed}
 		%% but not before we finish processing frames. We probably should have
 		%% a check in before_loop to let us stop looping if a flag is set.
 		{request_body, _Ref, fin, _, Data} ->
 			maybe_read_body(State),
-			parse(?reset_idle_timeout(State), HandlerState, ParseState, Data);
+			parse(reset_idle_timeout(State, HandlerState), HandlerState, ParseState, Data);
 		%% Timeouts.
 		{timeout, TRef, ?MODULE} ->
 			tick_idle_timeout(State, HandlerState, ParseState);
